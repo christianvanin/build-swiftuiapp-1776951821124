@@ -1,0 +1,86 @@
+name: Build Flutter iOS App
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Rigenera progetto iOS
+        run: |
+          rm -rf ios
+          flutter create --platforms=ios .
+          flutter pub get
+
+      - name: Installa xcodeproj gem
+        run: gem install xcodeproj
+
+      - name: Configura Progetto Xcode (Swift Files + Team ID)
+        run: |
+          # Copia i file fisici
+          cp -fv swift_backend/*.swift ios/Runner/
+          cd ios
+          ruby - <<'EOF'
+          require 'xcodeproj'
+          project = Xcodeproj::Project.open('Runner.xcodeproj')
+          target = project.targets.first
+          group = project.main_group['Runner']
+          
+          # 1. Aggiunge i file Swift al progetto
+          Dir['Runner/*.swift'].each do |file|
+            filename = File.basename(file)
+            next if group.files.any? { |f| f.display_name == filename }
+            file_ref = group.new_file(filename)
+            target.source_build_phase.add_file_reference(file_ref)
+            puts "Aggiunto file: #{filename}"
+          end
+          
+          # 2. Iniezione Team ID fittizio per bypassare il controllo Xcode
+          project.targets.each do |t|
+            t.build_configurations.each do |config|
+              config.build_settings['DEVELOPMENT_TEAM'] = '1234567890'
+              config.build_settings['CODE_SIGNING_ALLOWED'] = 'NO'
+            end
+          end
+          
+          project.save
+          puts "Team ID fittizio configurato con successo."
+          EOF
+
+      - name: Build IPA
+        run: |
+          flutter build ios --release --no-codesign
+
+      - name: Pacchettizza IPA
+        run: |
+          mkdir -p Payload
+          cp -a build/ios/iphoneos/Runner.app Payload/
+          rm -rf Payload/Runner.app/_CodeSignature
+          # Firma "ad-hoc" per rendere il pacchetto accettabile dal sistema
+          codesign --force --deep --sign - Payload/Runner.app
+          zip -yr UnsignedApp.ipa Payload
+
+      - name: Crea Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes || true
+          gh release create latest UnsignedApp.ipa \
+            --title "Build Ottimizzata" \
+            --notes "Build Flutter iOS con Swift backend e Team ID iniettato."
